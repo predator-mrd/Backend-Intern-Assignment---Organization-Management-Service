@@ -148,5 +148,13 @@ Press `Ctrl + C` in terminal
 `Ctrl + C`
 
 ---
+Class-Based Modular Design
 
-**Ready for production deployment on Railway/Render/Heroku**
+Component	      | Class	               |    Responsibility
+Config	        | Config	             |    Environment variables & settings
+Database	      |  Database	           |    MongoDB client & collections
+Utils	          |  Utils	             |    Slugify, hash, JWT, response formatting
+Schemas	        | Schemas	             |    Pydantic models for validation
+Business Logic	| OrganizationService	 |   CRUD operations
+Authentication	|  AuthService	       |    JWT, login, token validation
+
