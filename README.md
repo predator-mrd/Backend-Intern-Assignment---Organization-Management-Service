@@ -3,116 +3,147 @@
 
 
 
-# Organization Management Service
+## Setup & Run Instructions
 
-FastAPI + MongoDB multi-tenant backend with JWT authentication, bcrypt password hashing, and dynamic per-organization collections.
-
-## Quick Start
-
-### Prerequisites
+### Before You Start
 - Python 3.8+
-- MongoDB Community Server
+- MongoDB Community Server installed
 
-### 1. Start MongoDB
-Run Command Prompt as Administrator
+### 1. Start MongoDB (Windows)
+```bash
+# Run Command Prompt as Administrator
 net start MongoDB
+```
 
-text
+### 2. Go to Project Folder
+Open Command Prompt in your project directory
 
-### 2. Install Dependencies
+### 3. Install Dependencies
+```bash
 pip install fastapi "uvicorn[standard]" pymongo "python-jose[cryptography]" bcrypt "pydantic[email]" python-multipart
+```
 
-text
-
-### 3. Run Server
+### 4. Run Server
+```bash
 uvicorn main:app --reload
+```
 
-text
+Expected output:
+```
+Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+Application startup complete.
+```
 
-### 4. Open API Docs
-http://127.0.0.1:8000/docs
+### 5. Open API Docs
+Browser → `http://127.0.0.1:8000/docs`
 
-text
+---
 
-## API Endpoints
-
-| Method | Endpoint | Description | Auth |
-|--------|----------|-------------|------|
-| `POST` | `/org/create` | Create org + admin + collection | No |
-| `GET` | `/org/get` | Get org details | No |
-| `POST` | `/admin/login` | Get JWT token | No |
-| `PUT` | `/org/update` | Rename org + migrate data | Yes |
-| `DELETE` | `/org/delete` | Delete org + collection | Yes |
-
-## Testing Workflow
+## Testing Workflow (Swagger UI)
 
 ### 1. Create Organization
+POST /org/create
+```json
 {
-"organization_name": "AcmeCorp",
-"email": "admin@acme.com",
-"password": "StrongPass123"
+  "organization_name": "AcmeCorp",
+  "email": "admin@acme.com",
+  "password": "StrongPass123"
 }
-
-text
+```
+Response: `200 OK` with org metadata
 
 ### 2. Get Organization
-Query: `organization_name=AcmeCorp`
+GET /org/get?organization_name=AcmeCorp
+Response: `200 OK` org details
 
-### 3. Login (Copy `access_token`)
-username: admin@acme.com
-password: StrongPass123
-
-text
+### 3. Login & Get Token
+POST /admin/login
+- username: admin@acme.com
+- password: StrongPass123
+Response: `200 OK` with `access_token`
 
 ### 4. Authorize (Top-right green button)
+Set Bearer token:
+```
 Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
-
-text
+```
 
 ### 5. Update Organization
+PUT /org/update (with authorization)
+```json
 {
-"organization_name": "AcmeCorp",
-"new_organization_name": "AcmeGlobal",
-"email": "admin@acme.com",
-"password": "StrongPass123"
+  "organization_name": "AcmeCorp",
+  "new_organization_name": "AcmeGlobal",
+  "email": "admin@acme.com",
+  "password": "StrongPass123"
 }
-
-text
+```
+Response: `200 OK` updated org
 
 ### 6. Delete Organization
+DELETE /org/delete (with authorization)
+```json
 {
-"organization_name": "AcmeGlobal"
+  "organization_name": "AcmeGlobal"
 }
+```
+Response: `200 OK` success message
 
-text
+---
+
+## Database Schema
+
+```
+org_master_db
+├── organizations     {_id, name, collection_name, admin_id, created_at}
+├── admins            {_id, email, password_hash, org_id, created_at}
+├── org_acmecorp      (Tenant data - isolated)
+├── org_acmeglobal    (Tenant data - isolated)
+└── org_companyxyz    (Tenant data - isolated)
+```
+
+---
+
+## API Endpoints Summary
+
+| Method | Endpoint | Auth | Purpose |
+|--------|----------|------|---------|
+| POST | /org/create | No | Create org + admin |
+| GET | /org/get | No | Fetch org details |
+| POST | /admin/login | No | Get JWT token |
+| PUT | /org/update | Yes | Rename org + migrate |
+| DELETE | /org/delete | Yes | Delete org + cleanup |
+
+---
+
+## Key Features
+
+✅ **Multi-tenant**: Each org isolated in own MongoDB collection
+✅ **JWT Authentication**: Secure token-based auth with bcrypt
+✅ **Class-Based Design**: Modular, testable, maintainable
+✅ **Data Migration**: Automatic data migration on org rename
+✅ **Full API Docs**: Swagger UI at /docs
+✅ **Error Handling**: Comprehensive HTTP status codes
+✅ **Production-Ready**: Scalable, secure, deployable
+
+---
 
 ## Troubleshooting
 
-| Error | Fix |
-|-------|-----|
-| `500 ServerSelectionTimeoutError` | `net start MongoDB` (as admin) |
-| `401 Not authenticated` | Login → Copy token → Authorize |
-| `403 Cannot delete` | Use exact current `organization_name` |
-| `400 Organization already exists` | Use unique `organization_name` |
+| Issue | Solution |
+|-------|----------|
+| 500 ServerSelectionTimeoutError | Start MongoDB: `net start MongoDB` (admin) |
+| ModuleNotFoundError | Reinstall deps: `pip install -r requirements.txt` |
+| 401 Not authenticated | Login first, copy token, set Bearer header |
+| 403 Cannot delete | Use exact current organization name |
+| 400 Already exists | Use unique organization name |
 
-## Architecture
+---
 
-org_master_db (single DB)
-├── organizations (org metadata)
-├── admins (credentials)
-└── org_acmecorp (tenant data)
-├── org_acmeglobal (tenant data)
-└── org_* (dynamic per org)
+## Stop Server
+Press `Ctrl + C` in terminal
 
-text
-
-**Features:**
-- ✅ JWT + bcrypt security
-- ✅ Dynamic collection creation
-- ✅ Data migration on rename
-- ✅ Admin scoped to single org
-- ✅ Full Swagger UI docs
-
+---
 ## Stop Server
 `Ctrl + C`
 
