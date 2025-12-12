@@ -1,0 +1,274 @@
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel, EmailStr
+from typing import Optional, Dict, Any
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from pymongo import MongoClient
+from bson import ObjectId
+import bcrypt
+import os
+
+class Config:
+    MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+    MASTER_DB_NAME = os.getenv("MASTER_DB_NAME", "org_master_db")
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "SUPER_SECRET_KEY_CHANGE_ME")
+    JWT_ALGORITHM = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+
+class Database:
+    def __init__(self):
+        self.client = MongoClient(Config.MONGO_URI)
+        self.master_db = self.client[Config.MASTER_DB_NAME]
+        self.orgs_coll = self.master_db["organizations"]
+        self.admins_coll = self.master_db["admins"]
+    
+    def get_collection(self, collection_name: str):
+        return self.master_db[collection_name]
+
+db = Database()
+
+class Utils:
+    @staticmethod
+    def slugify(name: str) -> str:
+        return "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_")
+    
+    @staticmethod
+    def hash_password(password: str) -> str:
+        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    
+    @staticmethod
+    def verify_password(password: str, hashed: str) -> bool:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+    
+    @staticmethod
+    def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+        to_encode = data.copy()
+        expire = datetime.utcnow() + (expires_delta or timedelta(minutes=Config.ACCESS_TOKEN_EXPIRE_MINUTES))
+        to_encode.update({"exp": expire})
+        return jwt.encode(to_encode, Config.JWT_SECRET_KEY, algorithm=Config.JWT_ALGORITHM)
+    
+    @staticmethod
+    def org_doc_to_response(org_doc: Dict[str, Any], admin_email: str) -> Dict[str, Any]:
+        return {
+            "id": str(org_doc["_id"]),
+            "organization_name": org_doc["name"],
+            "collection_name": org_doc["collection_name"],
+            "admin_email": admin_email,
+        }
+
+class Schemas:
+    class OrgCreate(BaseModel):
+        organization_name: str
+        email: EmailStr
+        password: str
+    
+    class OrgUpdate(BaseModel):
+        organization_name: str
+        new_organization_name: str
+        email: EmailStr
+        password: str
+    
+    class OrgDelete(BaseModel):
+        organization_name: str
+    
+    class OrgResponse(BaseModel):
+        id: str
+        organization_name: str
+        collection_name: str
+        admin_email: EmailStr
+    
+    class Token(BaseModel):
+        access_token: str
+        token_type: str
+
+class OrganizationService:
+    def __init__(self, db: Database = db):
+        self.db = db
+        self.utils = Utils()
+    
+    def create_org(self, payload: Schemas.OrgCreate):
+        if self.get_org_by_name(payload.organization_name):
+            raise HTTPException(status_code=400, detail="Organization already exists")
+        
+        admin_doc = {
+            "email": payload.email.lower(),
+            "password_hash": self.utils.hash_password(payload.password),
+            "org_id": None,
+            "created_at": datetime.utcnow(),
+        }
+        admin_insert_result = self.db.admins_coll.insert_one(admin_doc)
+        admin_id = admin_insert_result.inserted_id
+        
+        slug = self.utils.slugify(payload.organization_name)
+        collection_name = f"org_{slug}"
+        org_doc = {
+            "name": payload.organization_name,
+            "collection_name": collection_name,
+            "admin_id": admin_id,
+            "connection_uri": Config.MONGO_URI,
+            "created_at": datetime.utcnow(),
+        }
+        org_insert_result = self.db.orgs_coll.insert_one(org_doc)
+        org_id = org_insert_result.inserted_id
+        
+        self.db.admins_coll.update_one({"_id": admin_id}, {"$set": {"org_id": org_id}})
+        
+        org_collection = self.db.get_collection(collection_name)
+        org_collection.insert_one({"_seed": True})
+        org_collection.delete_one({"_seed": True})
+        
+        org_doc = self.db.orgs_coll.find_one({"_id": org_id})
+        return self.utils.org_doc_to_response(org_doc, payload.email.lower())
+    
+    def get_org_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        return self.db.orgs_coll.find_one({"name": name})
+    
+    def get_org(self, organization_name: str):
+        org = self.get_org_by_name(organization_name)
+        if not org:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        admin = self.db.admins_coll.find_one({"_id": org["admin_id"]})
+        admin_email = admin["email"] if admin else "unknown@example.com"
+        return self.utils.org_doc_to_response(org, admin_email)
+    
+    def update_org(self, payload: Schemas.OrgUpdate):
+        org = self.get_org_by_name(payload.organization_name)
+        if not org:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        
+        admin = self.db.admins_coll.find_one({"_id": org["admin_id"]})
+        if (
+            not admin
+            or admin["email"] != payload.email.lower()
+            or not self.utils.verify_password(payload.password, admin["password_hash"])
+        ):
+            raise HTTPException(status_code=401, detail="Invalid admin credentials")
+        
+        if (
+            payload.new_organization_name != payload.organization_name
+            and self.get_org_by_name(payload.new_organization_name)
+        ):
+            raise HTTPException(status_code=400, detail="New organization name already exists")
+        
+        old_collection_name = org["collection_name"]
+        new_slug = self.utils.slugify(payload.new_organization_name)
+        new_collection_name = f"org_{new_slug}"
+        
+        old_collection = self.db.get_collection(old_collection_name)
+        new_collection = self.db.get_collection(new_collection_name)
+        
+        docs = list(old_collection.find({}))
+        if docs:
+            for d in docs:
+                d.pop("_id", None)
+            new_collection.insert_many(docs)
+        
+        self.db.master_db.drop_collection(old_collection_name)
+        
+        self.db.orgs_coll.update_one(
+            {"_id": org["_id"]},
+            {"$set": {"name": payload.new_organization_name, "collection_name": new_collection_name}},
+        )
+        updated_org = self.db.orgs_coll.find_one({"_id": org["_id"]})
+        return self.utils.org_doc_to_response(updated_org, admin["email"])
+    
+    def delete_org(self, payload: Schemas.OrgDelete, current_org: Dict[str, Any]):
+        org = current_org["org"]
+        if payload.organization_name != org["name"]:
+            raise HTTPException(status_code=403, detail="Cannot delete another organization")
+        
+        collection_name = org["collection_name"]
+        self.db.master_db.drop_collection(collection_name)
+        self.db.admins_coll.delete_many({"org_id": org["_id"]})
+        self.db.orgs_coll.delete_one({"_id": org["_id"]})
+        return {"detail": "Organization deleted successfully"}
+
+class AuthService:
+    def __init__(self, db: Database = db):
+        self.db = db
+        self.utils = Utils()
+        self.oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/admin/login")
+    
+    def get_admin_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        return self.db.admins_coll.find_one({"email": email.lower()})
+    
+    def get_org_by_id(self, org_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            return self.db.orgs_coll.find_one({"_id": ObjectId(org_id)})
+        except:
+            return None
+    
+    def get_admin_by_id(self, admin_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            return self.db.admins_coll.find_one({"_id": ObjectId(admin_id)})
+        except:
+            return None
+    
+    def login(self, form_data: OAuth2PasswordRequestForm):
+        admin = self.get_admin_by_email(form_data.username.lower())
+        if not admin or not self.utils.verify_password(form_data.password, admin["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        if not admin.get("org_id"):
+            raise HTTPException(status_code=400, detail="Admin not associated with any organization")
+        
+        access_token = self.utils.create_access_token(
+            data={"sub": str(admin["_id"]), "org_id": str(admin["org_id"])},
+        )
+        return Schemas.Token(access_token=access_token, token_type="bearer")
+    
+    async def get_current_admin(self, token: str = Depends(self.oauth2_scheme)):
+        credentials_exception = HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        try:
+            payload = jwt.decode(token, Config.JWT_SECRET_KEY, algorithms=[Config.JWT_ALGORITHM])
+            admin_id: str = payload.get("sub")
+            org_id: str = payload.get("org_id")
+            if admin_id is None or org_id is None:
+                raise credentials_exception
+        except JWTError:
+            raise credentials_exception
+        
+        admin = self.get_admin_by_id(admin_id)
+        org = self.get_org_by_id(org_id)
+        if admin is None or org is None:
+            raise credentials_exception
+        return {"admin": admin, "org": org}
+
+# Initialize services
+org_service = OrganizationService()
+auth_service = AuthService()
+
+# FastAPI app
+app = FastAPI(title="Organization Management Service (MongoDB)")
+
+@app.get("/")
+def root():
+    return {"message": "Organization Management Service running"}
+
+@app.post("/org/create", response_model=Schemas.OrgResponse)
+def create_organization(payload: Schemas.OrgCreate):
+    return org_service.create_org(payload)
+
+@app.get("/org/get", response_model=Schemas.OrgResponse)
+def get_organization(organization_name: str):
+    return org_service.get_org(organization_name)
+
+@app.put("/org/update", response_model=Schemas.OrgResponse)
+def update_organization(payload: Schemas.OrgUpdate):
+    return org_service.update_org(payload)
+
+@app.delete("/org/delete")
+def delete_organization(
+    payload: Schemas.OrgDelete, 
+    current=Depends(auth_service.get_current_admin)
+):
+    return org_service.delete_org(payload, current)
+
+@app.post("/admin/login", response_model=Schemas.Token)
+def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
+    return auth_service.login(form_data)
